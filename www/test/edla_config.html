@@ -1,0 +1,268 @@
+<html><!DOCTYPE html><html lang="en">
+<!--
+Configuration utility for EDLA 
+See https://iosoft.blog/edla for details
+
+Copyright (c) 2022 Jeremy P Bentham
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+v0.02 JPB 26/6/22 Tidied up for release
+-->
+<head><meta charset="utf-8"/>
+  <script type="text/javascript" src="dist/davclient.js"></script>
+  <script>
+    const CONFIG_DEFAULT = "/config/config_default.txt";
+    const CONFIG_UNIT    = "/config/config_unit$.txt";
+    const NUM_PROBES = 16;
+    var DAVUSER = "username", DAVPASS = "password";
+
+    window.addEventListener("load", function() {
+      unitChange();
+    });
+    
+    // Handle change of unit number
+    function unitChange() {
+      loadConfig(unitNum());
+    }
+
+    // Handle 'update' button
+    function doUpdate() {
+      saveConfig();
+    }
+
+    // Handle 'exit' button
+    function doExit() {
+      window.location.href = "edla.html";
+    }
+
+    // Return filename for given unit
+    function configFname(unit) {
+      return CONFIG_UNIT.replace('$', String(unit));
+    }
+
+    // Load the default config file, then unit-specific file
+    function loadConfig(unit) {
+      readFile(configFname(unit), loadHandler);
+    }
+
+    // Save the config file
+    function saveConfig() {
+      var fname = CONFIG_UNIT.replace('$', String(unitNum()));
+      dispStatus("File " + fname);
+      var ip = location.host.split(':')
+      var host = ip[0], port = ip[1];
+      port = !port ? 80 : parseInt(port);
+      var davclient = new davlib.DavClient();
+      console.log("Host " + host + " port " + port);
+      davclient.initialize(host, port, 'http', DAVUSER, DAVPASS);
+      davclient.PUT(fname, JSON.stringify(getFormData()), saveHandler)
+    }
+
+    // Handler called after config is saved
+    function saveHandler(status, statusstr, content) {
+      console.log("Status " + status);
+      if (status!=200 && status!=201 && status!=204) {
+        addStatus(" error: " + statusstr);
+      }
+      else {
+        addStatus(" written");
+      };
+    };
+
+    // Handler for a loaded config file
+    function loadHandler(fname, s) {
+      try {
+        var configs = JSON.parse(s);
+      }
+      catch {
+        dispStatus("JSON syntax error in " + fname);
+        return false;
+      }
+      addStatus(" read");
+      setFormData(configs);
+      return true;
+    }
+
+    // Set configuration form using object data
+    function setFormData(cfgs) {
+      for (var entry of Object.entries(cfgs)) {
+        var name=entry[0], val=entry[1];
+        if (name=='probes' && val instanceof Array) {
+          for (var i=0; i<val.length; i++) {
+            var n=i+1, obj=document.getElementById("probe" + n);
+            if (obj) {
+              obj.value = val[i];
+            }
+          }
+        }
+        else if (name == "trig_chan") {
+          var n = parseInt(val);
+          if (n>=0 && n<=NUM_PROBES) {
+            var obj = document.getElementById("trig" + val);
+            if (obj) {
+              obj.checked = true;
+            }
+          }
+        }
+        else if (name != "unit") {
+          var obj = document.getElementById(name);
+          if (obj) {
+            obj.value = val;
+          }
+        }
+      }
+    }
+
+    // Get object data from configuration form
+    function getFormData() {
+      var formdata = new FormData(document.getElementById("config_form"));
+      var configs = {probes:[]};
+      for (var entry of formdata.entries()) {
+        var name=entry[0], val=entry[1];
+        if (name.startsWith("probe")) {
+          var num = parseInt(name.substr(5));
+          configs.probes[num-1] = val;
+        }
+        else {
+          configs[name] = val;
+        }
+      }
+      return configs;
+    }
+
+    // Read a file, with async callback
+    function readFile(fname, handler) {
+      var txt="", req=new XMLHttpRequest();
+      req.open("GET", fname, true);
+      req.onload = function() {
+        if (req.status != 200 || !handler(fname, req.responseText)) {
+          dispStatus("Can't read " + fname);
+          if (fname != CONFIG_DEFAULT) {
+            readFile(CONFIG_DEFAULT, handler);
+          }
+        }
+        else {
+          dispStatus('File ' + fname);
+          handler(fname, req.responseText);
+        }
+      }
+      req.send();
+    }
+
+    // Get the unit number from form
+    function unitNum() {
+      return parseInt(document.getElementById("unit").value);
+    }
+
+    // Display status text
+    function dispStatus(s) {
+      var stat = document.getElementById("statusText");
+      stat.innerHTML = s;
+    }
+    // Update status text
+    function addStatus(news) {
+      var stat = document.getElementById("statusText"), s=stat.innerHTML;
+      stat.innerHTML = s + news;
+    }
+
+  </script><style>
+  *                {font:10pt Arial,sans-serif;}
+  th               {font-weight: bold;}
+  input[type=text] {border:1px solid #ccc; padding:3px;}
+  th               {font:bold; text-align:left; padding-right:6px;}
+  select           {display:inline-block; border:1px solid #ccc;}
+  .button          {margin:1px 10px 1px 10px;}
+  </style></head><body>
+  <form id="config_form" action="/config_action" method="post">
+    <table>
+      <tr><td>Unit number</td>
+        <td><select name="unit" id="unit" onchange="unitChange()">
+          <option value=1>1</option><option value=2>2</option><option value=3>3</option>
+          <option value=4>4</option><option value=5>5</option><option value=6>6</option>
+          </select></td></tr>
+        <tr><td>Threshold</td>
+        <td><input type="text" id="thresh" name="thresh" size="1" value="10"></input></td>
+      </tr><tr>
+        <td>Samples</td>
+        <td><select name="xsamp" id="xsamp">
+          <option value=10000>10k</option><option value=20000>20K</option>
+          <option value=50000>50K</option><option value=100000>100k</option>
+          <option value=200000>200k</option>
+        </select></td>
+        <td>Rate</td>
+        <td><select name="xrate" id="xrate">
+          <option value=10000>10 kS/s</option>  <option value=20000>20 kS/s</option>
+          <option value=50000>50 kS/s</option>  <option value=100000>100 kS/s</option>
+          <option value=200000>200 kS/s</option><option value=500000>500 kS/s</option>
+          <option value=1000000>1 MS/s</option> <option value=2000000>2 MS/s</option>
+          <option value=5000000>5 MS/s</option> <option value=10000000>10 MS/s</option>
+          <option value=20000000>20 MS/s</option>
+        </select></td></tr>
+        <tr><td>Trigger pos</td>
+        <td><select name="trig_pos" id="trig_pos">
+          <option value=1>1</option>  <option value=2>2</option>
+          <option value=3>3</option>  <option value=4>4</option>
+          <option value=5>5</option>  <option value=6>6</option>
+          <option value=7>7</option>  <option value=8>8</option>
+          <option value=9>9</option>
+        </select></td>
+        <td>Mode</td>
+        <td><select name="trig_mode" id="trig_mode">
+          <option value=0>None</option><option value=1>+ve edge</option>
+          <option value=2>-ve edge</option>
+        </select></td></tr>
+      </tr>
+    <tr height="10px"></tr>
+    </table>
+    <table>
+      <tr><th>Probe</th><th>Label</th><th>Trigger</th></tr>
+      <tr><td>1</td><td><input type="text" name="probe1" id="probe1"></td>
+        <td><input type="radio"  name="trig_chan" id="trig1" value="1"></td></tr>
+      <tr><td>2</td><td><input type="text" name="probe2" id="probe2"></td>
+        <td><input type="radio"  name="trig_chan" id="trig2" value="2"></td></tr>
+      <tr><td>3</td><td><input type="text" name="probe3" id="probe3"></td>
+        <td><input type="radio"  name="trig_chan" id="trig3" value="3"></td></tr>
+      <tr><td>4</td><td><input type="text" name="probe4" id="probe4"></td>
+        <td><input type="radio"  name="trig_chan" id="trig4" value="4"></td></tr>
+      <tr><td>5</td><td><input type="text" name="probe5" id="probe5"></td>
+        <td><input type="radio"  name="trig_chan" id="trig5" value="5"></td></tr>
+      <tr><td>6</td><td><input type="text" name="probe6" id="probe6"></td>
+        <td><input type="radio"  name="trig_chan" id="trig6" value="6"></td></tr>
+      <tr><td>7</td><td><input type="text" name="probe7" id="probe7"></td>
+        <td><input type="radio"  name="trig_chan" id="trig7" value="7"></td></tr>
+      <tr><td>8</td><td><input type="text" name="probe8" id="probe8"></td>
+        <td><input type="radio"  name="trig_chan" id="trig8" value="8"></td></tr>
+      <tr><td>9</td><td><input type="text" name="probe9" id="probe9"></td>
+        <td><input type="radio"  name="trig_chan" id="trig9" value="9"></td></tr>
+      <tr><td>10</td><td><input type="text" name="probe10" id="probe10"></td>
+        <td><input type="radio"  name="trig_chan" id="trig10" value="10"></td></tr>
+      <tr><td>11</td><td><input type="text" name="probe11" id="probe11"></td>
+        <td><input type="radio"  name="trig_chan" id="trig11" value="11"></td></tr>
+      <tr><td>12</td><td><input type="text" name="probe12" id="probe12"></td>
+        <td><input type="radio"  name="trig_chan" id="trig12" value="12"></td></tr>
+      <tr><td>13</td><td><input type="text" name="probe13" id="probe13"></td>
+        <td><input type="radio"  name="trig_chan" id="trig13" value="13"></td></tr>
+      <tr><td>14</td><td><input type="text" name="probe14" id="probe14"></td>
+        <td><input type="radio"  name="trig_chan" id="trig14" value="14"></td></tr>
+      <tr><td>15</td><td><input type="text" name="probe15" id="probe15"></td>
+        <td><input type="radio"  name="trig_chan" id="trig15" value="15"></td></tr>
+      <tr><td>16</td><td><input type="text" name="probe16" id="probe16"></td>
+        <td><input type="radio"  name="trig_chan" id="trig16" value="16"></td></tr>
+      <tr><td></td><td>[No trigger]</td>
+        <td><input type="radio"  name="trig_chan" id="trig0" value="0"></td></tr>
+    </table>
+  </form>
+  <input type="button" class="button" onclick="doUpdate()" value="Update">
+  <input type="button" class="button" onclick="doExit()" value="Exit"/>
+  <pre id="statusText"></pre>
+</body></html>
+

@@ -1,0 +1,757 @@
+<html><!DOCTYPE html><html lang="en">
+<!-- 
+Remote logic analyser display using AJAX
+See https://iosoft.blog/edla for details
+
+Copyright (c) 2022 Jeremy P Bentham
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+v0.08 JPB 26/6/22 Tidied up for release
+-->
+<head><meta charset="utf-8"/>
+  <script type="text/javascript" src="dist/jszip.js"></script>
+  <script type="text/javascript" src="dist/jszip-utils.js"></script>
+  <script type="text/javascript" language="javascript"> "use strict";
+
+    // Display definitions
+    var ctx1, xdivisions=10, ydivisions=16, winxpad=25, winypad=90;
+    var ctx2, marker_height=12, marker_width=12, simoff=1;
+    var probes=[], mark1x=0, mark2x=0;
+    var nchans=16, zoom=1, samp_mid=0, dragging=false, moveX=0, lastx=0;
+    const grid_bg="#d8e8d8", grid_fg="#40f040", label_font="14px Arial";
+
+    // State machine values
+    const DRAG_DISP=1, DRAG_MARK1=2, DRAG_MARK2=3;
+    const CMD_STOP=0, CMD_SINGLE=1, CMD_MULTI=2;
+    const STATE_IDLE=0, STATE_READY=1, STATE_PRELOAD=2, STATE_PRETRIG=3;
+    const STATE_POSTTRIG=4, STATE_UPLOAD=5, RETRIES=3;
+    const state_strs = ["IDLE", "READY", "PRE-LOAD", "PRE-TRIG", "POST-TRIG", "UPLOAD"];
+    var last_state = STATE_IDLE;
+
+    // HTTP interface to units
+    var command=0, http_request=null, remote_status, sampledata=[], retry_count;
+    var capname = "data.txt", statusname = "status.txt", repeat_timer;
+    var remip_base = "http://192.168.8.", remip_oset=10;
+    const CONFIG_UNIT = "/config/config_unit$.txt";
+
+    // Sigrok zipfile definitions
+    const fname1="metadata", fname2 = "logic-1-1";
+    var sr_dict = {
+      "head1":"[global]",   "sigrok version":"0.5.1",
+      "head2":"[device 1]", "capturefile":"logic-1",  "total probes":16,
+      "total analog":0,     "samplerate":"1 kHz"
+    };
+
+    // Definitions for scaling values
+    const exp_si = {'9':'G', '6':'M', '3':'k', '0':'', '-3':'m','-6':'µ','-9':'n'};
+    const si_exp = dict_swap(exp_si);
+
+    // Handle event: application loaded
+    window.addEventListener("load", function() {
+      ctx1 = document.getElementById("canvas1").getContext("2d");
+      ctx2 = document.getElementById("canvas2").getContext("2d");
+      resize();
+      resetMarkers(ctx2);
+      window.addEventListener('resize', resize, false);
+      ctx1.canvas.addEventListener('mousedown', mouseDown1);
+      ctx2.canvas.addEventListener('mousedown', mouseDown2);
+      window.addEventListener('mousemove', mouseMove);
+      window.addEventListener('mouseup', mouseUp);
+      doThreshold();
+      unitChange();
+    } );
+
+    // Draw grid in display area
+    function drawGrid(ctx) {
+      var w=ctx.canvas.clientWidth, h=ctx.canvas.clientHeight;
+      var dw = w/xdivisions, dh=h/ydivisions;
+      ctx.fillStyle = grid_bg;
+      ctx.fillRect(0, 0, w, h);
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = grid_fg;
+      ctx.strokeRect(0, 1, w-1, h-1);
+      ctx.beginPath();
+      for (var n=0; n<xdivisions; n++) {
+        var x = n*dw;
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, h);
+        ctx.fillStyle = 'blue';
+        if (n)
+            drawXLabel(ctx, x, h-5);
+      }
+      for (var n=0; n<ydivisions; n++) {
+        var y = n*dh;
+        ctx.moveTo(0, y);
+        ctx.lineTo(w, y);
+      }
+      ctx.stroke();
+    }
+
+    // Draw logic traces
+    function drawLogic(ctx, data) {
+      for (var bit=0; bit<nchans; bit++) {
+        drawLogicLine(ctx, bit, data);
+      }
+    }
+
+    // Draw & label a digital trace, or just label if no data
+    function drawLogicLine(ctx, bit, data) {
+      var w=ctx.canvas.clientWidth, h=ctx.canvas.clientHeight;
+      var y0 = (bit + 1) * h/nchans - 2, y1 = y0 - 0.8*h/nchans;
+      if (data) {
+        var dx = w * zoom / data.length, msk=1<<bit, lastval=0;
+        var nmax=data.length/zoom, samp_oset=samp_mid-nmax/2;
+        ctx.beginPath();
+        var val = data[samp_oset] & msk;
+        lastval = val;
+        ctx.moveTo(0, val ? y1 : y0);
+        for (var n=1; n<nmax; n++) {
+          val = data[n + samp_oset] & msk;
+          if (lastval != val) {
+            ctx.lineTo(n*dx, lastval ? y1 : y0);
+            ctx.lineTo(n*dx, val ? y1 : y0);
+            lastval = val;
+          }
+        }
+        ctx.lineTo(n*dx, val ? y1 : y0);
+        ctx.strokeStyle = "red";
+        ctx.stroke();
+      }
+      ctx.fillStyle = 'blue';
+      var s = " " + (probes.length>0 ? probes[bit] : bit+1);
+      if (bit+1 == parseInt(elem("trig_chan").value))
+        s += " [T]";
+      drawTextBox(ctx, 0, y0-3, s);
+    }
+
+    // Draw marker
+    function drawMarker(ctx, x, right=false) {
+      ctx.beginPath();
+      ctx.strokeStyle = "blue";
+      ctx.moveTo(x, marker_height);
+      ctx.lineTo(x, 0);
+      ctx.lineTo(right?x-marker_width : x+marker_width, marker_height);
+      ctx.lineTo(x, marker_height);
+      ctx.stroke();
+    }
+
+    // Draw marker line
+    function drawMarkerLine(ctx, x) {
+      var w=ctx.canvas.clientWidth, h=ctx.canvas.clientHeight;
+      if (x>1 && x<w-2) {
+        ctx.beginPath();
+        ctx.strokeStyle = "blue";
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, h);
+        ctx.stroke();
+      }
+    }
+
+    // Draw both markers, given x positions
+    function drawMarkers(x1, x2) {
+      ctx2.clearRect(0, 0, ctx2.canvas.clientWidth, ctx2.canvas.clientHeight);
+      drawMarker(ctx2, x1);
+      drawMarker(ctx2, x2, true);
+      if (!dragging) {
+        drawMarkerLine(ctx1, x1);
+        drawMarkerLine(ctx1, x2);
+      }
+    }
+
+    // Reset the marker positions to edges of plot area
+    function resetMarkers(ctx) {
+      mark1x = 0;
+      mark2x = ctx.canvas.width;
+      drawMarkers(mark1x, mark2x);
+    }
+
+    // Convert string of 16-bit values to binary array
+    function strbin16(s) {
+      var vals = [];
+      for (var n=0; n<s.length;) {
+        var v = s.charCodeAt(n++);
+        vals.push(v | s.charCodeAt(n++) << 8);
+      }
+      return vals;
+    }
+
+    // Get data from HTTP response
+    function getData(resp) {
+      var d = resp.replaceAll("\n", "");
+      return strbin16(atob(d));
+    }
+
+    // Plot data
+    function plotData(ctx, d) {
+      if (sampledata)
+        drawLogic(ctx, sampledata);
+    }
+
+    // Handle change in threshold value
+    function doThreshold(e) {
+      elem("thresh").value = elem("thresh_range").value;
+    }
+
+    // Handle 'load' button press
+    function doLoad(e) {
+      var evt = e || event;
+      evt.preventDefault();
+      retry_count = 0;
+      dispStatus("Reading status from " + remote_ip() + ": ");
+      get_status();
+    }
+
+    // Handle 'single' button press
+    function doSingle(e) {
+      var evt = e || event;
+      evt.preventDefault();
+      command = CMD_SINGLE;
+      doStart();
+    }
+
+    // Handle 'multi' button press (also acts as 'stop')
+    function doMulti(e) {
+      var evt = e || event;
+      evt.preventDefault();
+      if (command)
+        doStop();
+      else {
+        command = CMD_MULTI;
+        doStart();
+      }
+    }
+
+    // Stop the capture
+    function doStop(e) {
+      clearTimeout(repeat_timer);
+      if (!elem("simulate").checked) {
+        if (http_request && http_request.readyState>0 && http_request.readyState<4)
+          http_request.abort();
+        http_request.removeEventListener("progress", capfile_progress_handler);
+        http_request.removeEventListener( "load", capfile_load_handler);
+      }
+      command = CMD_STOP;
+      showStatus();
+      elem("multi").innerText = "Multi";
+    }
+
+    // Start a capture
+    function doStart() {
+      elem("multi").innerText = "Stop";
+      sampledata = [];
+      if (elem("simulate").checked) {
+        doSim();
+        doZoomReset();
+        if (command == CMD_MULTI)
+          window.requestAnimationFrame(doStart);
+        else
+          doStop();
+      } else {
+        retry_count = 0;
+        dispStatus("Reading status from " + remote_ip() + ": ");
+        get_status(CMD_SINGLE);
+      }
+    }
+
+    // Simulate a capture
+    function doSim() {
+      var nsamp = elem("xsamp").value;
+      sampledata = [];
+      for (var i=0; i<nsamp; i++) {
+        sampledata.push(i+simoff);
+      }
+      simoff += 10;
+    }
+
+    // Get status from unit, optionally send command
+    function get_status(cmd=null) {
+      http_request = new XMLHttpRequest();
+      http_request.addEventListener("load", status_handler);
+      http_request.addEventListener("error", status_fail);
+      http_request.addEventListener("timeout", status_fail);
+      var params = formParams(cmd), statusfile=remote_ip()+'/'+statusname;
+      http_request.open( "GET", statusfile + "?" + encodeURI(params.join("&")));
+      http_request.timeout = 2000;
+      http_request.send();
+    }
+
+    // Handle failure to fetch status page
+    function status_fail(e) {
+      var evt = e || event;
+      evt.preventDefault();
+      if (retry_count < RETRIES) {
+        addStatus(retry_count ? "." : " RETRYING")
+        get_status();
+        retry_count++;
+      }
+      else {
+        doStop();
+        redraw(ctx1);
+      }
+    }
+
+    // Decode status response
+    function status_handler(e) {
+      var evt = e || event;
+      var remote_status = JSON.parse(evt.target.responseText);
+      var state = remote_status.state;
+      if (state != last_state) {
+        dispStatus(state_strs[state]);
+        last_state = state;
+      }
+      addStatus(".");
+      if (state==STATE_IDLE || state==STATE_PRELOAD ||
+          state==STATE_PRETRIG || state==STATE_POSTTRIG) {
+        repeat_timer = setTimeout(get_status, 500);
+      }
+      else if (remote_status.state == STATE_READY) {
+        loadData();
+      }
+      else {
+        doStop();
+      }
+    }
+
+    // Read captured data (display is done by callback)
+    function loadData() {
+      dispStatus("Reading from " + remote_ip());
+      http_request = new XMLHttpRequest();
+      http_request.addEventListener("progress", capfile_progress_handler);
+      http_request.addEventListener( "load", capfile_load_handler);
+      var params = formParams(), capfile=remote_ip()+'/'+capname;
+      http_request.open( "GET", capfile + "?" + encodeURI(params.join("&")));
+      http_request.send();
+    }
+
+    // Change zoom level
+    function doZoom(n) {
+      zoom = n;
+      redraw(ctx1);
+    }
+
+    // Reset zoom level and offset
+    function doZoomReset(e) {
+      var evt = e || event;
+      if (evt) {
+        evt.preventDefault();
+      }
+      zoom = elem("zoom").value = 1;
+      var nmax=sampledata.length/zoom;
+      samp_mid = nmax / 2;
+      resetMarkers(ctx2);
+      redraw(ctx1);
+    }
+
+    // Update progress display
+    function capfile_progress_handler() {
+      addStatus(".");
+    }
+
+    // Redraw display
+    function redraw(ctx) {
+      drawGrid(ctx);
+      plotData(ctx, sampledata);
+      drawMarkers(mark1x, mark2x);
+    }
+
+    // Display data (from callback event)
+    function capfile_load_handler(event) {
+      sampledata = getData(event.target.responseText);
+      doZoomReset();
+      if (command == CMD_MULTI)
+        window.requestAnimationFrame(doStart);
+      else
+        doStop();
+    }
+
+    // Respond to mouse button down: dragging display
+    function mouseDown1(e) {
+      var evt = e || event;
+      evt.preventDefault();
+      dragging = DRAG_DISP;
+      lastx = evt.clientX;
+    };
+
+    // Respond to mouse button down: dragging marker
+    function mouseDown2(e) {
+      var evt = e || event;
+      evt.preventDefault();
+      lastx = evt.clientX;
+      dragging = Math.abs(lastx-mark1x) <= Math.abs(lastx-mark2x) ? DRAG_MARK1 : DRAG_MARK2;
+    };
+
+    // Respond to mouse movement
+    function mouseMove(e) {
+      var evt = e || event;
+      evt.preventDefault();
+      if (dragging) {
+        var delta = evt.clientX - lastx;
+        lastx = evt.clientX;
+        moveX += delta;
+        if (dragging == DRAG_DISP)
+          ctx1.canvas.style.marginLeft = moveX + "px";
+        else if (dragging == DRAG_MARK1) {
+            mark1x += delta;
+            drawMarkers(mark1x, mark2x);
+        } else if (dragging == DRAG_MARK2) {
+            mark2x += delta;
+            drawMarkers(mark1x, mark2x);
+        }
+      }
+    }
+
+    // Respond to mouse button up
+    function mouseUp() {
+      const nsamp = sampledata.length;
+      if (dragging == DRAG_DISP) {
+        samp_mid += Math.round(-moveX * nsamp / (ctx1.canvas.clientWidth * zoom));
+        ctx1.canvas.style.marginLeft = 4;
+      }
+      moveX = 0;
+      dragging = false;
+      redraw(ctx1);
+      drawMarkers(mark1x, mark2x);
+      showStatus();
+    }
+
+    // Label grid x-value
+    function drawXLabel(ctx, x, y) {
+      const nsamp=sampledata.length, n=xSample(x), t=sampleTime(n);
+      if (nsamp && t>=0) {
+        drawTextBox(ctx, x, y, num_si(t)+'s');
+      }
+    }
+
+    // Convert display x-value to sample number
+    function xSample(x) {
+      var n=-1, w=ctx1.canvas.clientWidth, nsamp=sampledata.length;
+      if (nsamp && x>=0 && x<w) {
+          n = samp_mid - nsamp/2 + nsamp * x / (w * zoom);
+      }
+      return Math.round(n);
+    }
+    // Convert sample number to display x-value
+    function sampleX(n) {
+      var x=0, w=ctx1.canvas.clientWidth, nsamp=sampledata.length;
+      if (nsamp)
+          x = (n - samp_mid - nsamp/2) * w * zoom / nsamp;
+      return Math.round(x);
+    }
+
+    // Convert sample number to time value
+    function sampleTime(n) {
+      if (n > 0) {
+        const xrate = elem("xrate").value;
+        return n / xrate;
+      }
+      return -1;
+    }
+    // Convert time value to sample number
+    function timeSample(t) {
+        const xrate=elem("xrate").value;
+        return t * xrate;
+    }
+
+    // Get form parameters
+    function formParams(cmd) {
+      var formdata = new FormData(document.getElementById("captureForm"));
+      var params = [];
+      for (var entry of formdata.entries()) {
+        params.push(entry[0]+ '=' + entry[1]);
+      }
+      if (cmd != null)
+        params.push("cmd=" + cmd);
+      return params;
+    }
+
+    // Respond to window being resized
+    function resize() {
+      ctx1.canvas.width = window.innerWidth - winxpad;
+      ctx1.canvas.height = window.innerHeight - winypad - marker_height;
+      ctx2.canvas.width = window.innerWidth - winxpad;
+      ctx2.canvas.height = marker_height;
+      redraw(ctx1);
+      showStatus();
+    }
+
+    // Show current status
+    function showStatus() {
+      dispStatus(sampledata.length + " samples");
+      var mark1t = sampleTime(xSample(mark1x));
+      if (mark1t >= 0)
+        addStatus(" t1=" + num_si(mark1t) + "s");
+      var mark2t = sampleTime(xSample(mark2x));
+      if (mark2t >= 0)
+        addStatus(" t2=" + num_si(mark2t) + "s");
+      if (mark1t >= 0 && mark2t >= 0) {
+        const dt=mark2t-mark1t, f=dt ? 1.0/dt : 0;
+        addStatus(" dt=" + num_si(dt) + "s");
+        addStatus("," + num_si(f) + "Hz");
+      }
+    }
+
+    // Respond to 'Config' button
+    function doConfig(e) {
+      var evt = e || event;
+      evt.preventDefault();
+      window.location.href = "edla_config.html";
+    }
+
+    // Respond to 'Write' button
+    function doWriter(e) {
+      var evt = e || event;
+      evt.preventDefault();
+      const dat = new Date();
+      var y=dat.getFullYear()%100, m=dat.getMonth()+1, d=dat.getDate();
+      var s = y.toString() + m.toString().padStart(2, '0') + d.toString().padStart(2, '0');
+      write_srdata(s + ".sr");
+    }
+
+    // Write file to disk
+    function writeFile(fname, typ, data) {
+      var a = document.createElement('a');
+      const file = new Blob([data], {type: typ});
+      a.href= URL.createObjectURL(file);
+      a.download = fname;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    };
+
+    // Write data to sigrok file
+    function write_srdata(fname) {
+      var meta = encodeMeta(), zip = new JSZip();
+      var samps = new Uint16Array(sampledata);
+      zip.file("metadata", meta);
+      zip.file("version", "2");
+      zip.file("logic-1-1", samps.buffer);
+      zip.generateAsync({type:"blob", compression:"DEFLATE"})
+      .then(function(content) {
+        writeFile(fname, "application/zip", content);
+      });
+    }
+
+    // Encode Sigrok metadata
+    function encodeMeta() {
+      var meta=[], rate=elem("xrate").value + " Hz";
+      for (var key in sr_dict) {
+        var val = key=="samplerate" ? rate : sr_dict[key];
+        meta.push(val[0]=='[' ? ((meta.length ? "\n" : "") + val) : key+'='+val);
+      }
+      for (var n=0; n<nchans; n++) {
+        meta.push("probe"+(n+1) + "=" + (probes.length?probes[n]:n+1));
+      }
+      meta.push("unitsize=2");
+      return meta.join("\n");
+    }
+
+    // Handle change of unit number
+    function unitChange() {
+      loadConfig(unitNum());
+    }
+
+    // Load the config file
+    function loadConfig(unit) {
+      readFile(configFname(unit), loadHandler);
+    }
+
+    // Read a file, with async callback
+    function readFile(fname, handler) {
+      var txt="", req=new XMLHttpRequest();
+      req.open("GET", fname, true);
+      req.onload = function() {
+        if (req.status != 200) {
+          dispStatus("Can't read " + fname);
+        }
+        else if (!handler(fname, req.responseText)) {
+          dispStatus("No JSON file " + fname);
+        } else {
+          dispStatus('File ' + fname);
+        }
+      }
+      req.send();
+    }
+
+    // Handler for a loaded config file
+    function loadHandler(fname, s) {
+      try {
+        var configs = JSON.parse(s);
+      }
+      catch {
+        dispStatus("JSON syntax error in " + fname);
+        return false;
+      }
+      addStatus(" read");
+      setFormData(configs);
+      return true;
+    }
+
+    // Set configuration form using object data
+    function setFormData(cfgs) {
+      for (var entry of Object.entries(cfgs)) {
+        var name=entry[0], val=entry[1];
+        if (name=='probes' && val instanceof Array) {
+          for (var i=0; i<val.length; i++) {
+            probes[i] = val[i];
+          }
+        }
+        else if (name != "unit") {
+          var obj = document.getElementById(name);
+          if (obj) {
+            obj.value = val;
+          }
+        }
+      }
+      redraw(ctx1);
+    }
+
+    // Return filename for given unit
+    function configFname(unit) {
+      return CONFIG_UNIT.replace('$', String(unit));
+    }
+
+    // Get the unit number from form
+    function unitNum() {
+      return parseInt(elem("unit").value);
+    }
+
+    // Swap dictionary keys and values
+    function dict_swap(d) {
+      return Object.entries(d).reduce((r, [k, v]) => (r[v]=k, r), {});
+    }
+
+    // Get remote IP address
+    function remote_ip() {
+      return remip_base + (parseInt(elem("unit").value) + remip_oset);
+    }
+
+    // Decode number with appended SI units prefix, return value
+    function si_num(s) {
+      var n=0, re = / *(-?[0-9]*\.?[0-9]*) *([a-zA-Z]?)/;
+      var match = re.exec(s);
+      if (match.length >= 2) {
+        n = parseFloat(match[1]);
+        var exp = si_exp[match[2]];
+        if (exp != null)
+          n *= 10 ** exp;
+      }
+      return n;
+    }
+
+    // Scale & append SI units prefix to number
+    function num_si(n) {
+      if (n == 0)
+        return '0';
+      var val = Math.abs(n), exp=0;
+      while (val>=1000 && exp<9) {
+        val /= 1000;
+        exp += 3;
+      }
+      while (val<1 && exp>-9) {
+        val *= 1000;
+        exp -= 3;
+      }
+      var s = n<0 ? "-" : "";
+      return s+parseFloat(val.toPrecision(4))+exp_si[exp];
+    }
+
+    // Display status text
+    function dispStatus(s) {
+      var stat = elem("statusText");
+      stat.innerHTML = s;
+    }
+    // Update status text
+    function addStatus(news) {
+      var stat = elem("statusText"), s=stat.innerHTML;
+      s = s.replace("..........", ".");
+      stat.innerHTML = s + news;
+    }
+
+    // Draw text box
+    function drawTextBox(ctx, x, y, s) {
+      ctx.font = label_font;
+      ctx.fillText(s, x, y);
+    }
+
+    // Return a document element, given ID
+    function elem(id) {
+      return document.getElementById(id);
+    }
+
+  </script><style>
+    *                   {font:10pt Arial,sans-serif;}
+    pre                 {margin-left: 10px; margin:5px; padding:0; font:11pt Courier}
+    fieldset            {display:inline; padding:2px}
+    button, select      {border-radius:5px; padding:3px;}
+    body, canvas, form  {margin:2px; margin-left:5px; padding:0;}
+    canvas              {display:block;}
+    .thresh_range       {width:70px}
+    .thresh             {width:25px; height:20px; border-style:none;}
+  </style></head><body>
+  <form id="captureForm">
+    <fieldset><legend>Unit</legend>
+      <select name="unit" id="unit" onchange="unitChange()">
+        <option value=1>1</option><option value=2>2</option><option value=3>3</option>
+        <option value=4>4</option><option value=5>5</option><option value=6>6</option>
+      </select>
+    </fieldset>
+    <fieldset><legend>Capture</legend>
+      <button id="load" onclick="doLoad()">Load</button>
+      <button id="single" onclick="doSingle()">Single</button>
+      <button id="multi" onclick="doMulti()">Multi</button>
+      <label for="simulate">Sim</label>
+      <input type="checkbox" id="simulate" name="simulate">
+    </fieldset>
+    <fieldset><legend>Threshold (V)</legend>
+      <input type="range" id="thresh_range" class="thresh_range" max=50 value=10
+        oninput="doThreshold()">
+      <input type="text" id="thresh" name="thresh" class="thresh" size=2>
+    </fieldset>
+    <fieldset><legend>Samples</legend>
+      <select name="xsamp" id="xsamp">
+        <option value=10000>10k</option><option value=20000>20K</option>
+        <option value=50000>50K</option><option value=100000>100k</option>
+        <option value=200000>200k</option>
+      </select>
+      <select name="xrate" id="xrate">
+        <option value=10000>10 kS/s</option>  <option value=20000>20 kS/s</option>
+        <option value=50000>50 kS/s</option>  <option value=100000>100 kS/s</option>
+        <option value=200000>200 kS/s</option><option value=500000>500 kS/s</option>
+        <option value=1000000>1 MS/s</option> <option value=2000000>2 MS/s</option>
+        <option value=5000000>5 MS/s</option> <option value=10000000>10 MS/s</option>
+        <option value=20000000>20 MS/s</option>
+      </select>
+    </fieldset>
+    <fieldset><legend>Trigger</legend>
+      <label for "trig_mode">Edge</label>
+      <select name="trig_mode" id="trig_mode">
+        <option value=0>None</option><option value=1>+ve</option>
+        <option value=2>-ve</option>
+      </select>
+      <input type="hidden" name="trig_chan" id="trig_chan" value=0>
+    </fieldset>
+    <fieldset><legend>File</legend>
+      <button id="write" onclick="doWriter()">Write</button>
+      <button id="config" onclick="doConfig()">Config</button>
+    </fieldset>
+    <fieldset><legend>Display</legend>
+      <button id="zoom_reset" onclick="doZoomReset()">Reset</button>
+      <select name="zoom" id="zoom" onchange="doZoom(this.options[this.selectedIndex].value)">
+        <option value=1>x1</option>    <option value=2>x2</option>    <option value=5>x5</option>
+        <option value=10>x10</option>  <option value=20>x20</option>  <option value=50>x50</option>
+        <option value=100>x100</option><option value=200>x200</option><option value=500>x500</option>
+      </select>
+    </fieldset>
+  </form>
+  <canvas id="canvas1"></canvas>
+  <canvas id="canvas2"></canvas>
+  <pre id="statusText"></pre>
+</body></html>
